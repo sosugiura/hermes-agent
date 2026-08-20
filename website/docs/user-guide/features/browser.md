@@ -72,6 +72,24 @@ The mode is a **driver** that composes with your configured browser backend: it 
 
 **Concurrent sessions:** `browser_exec` accepts a `session=<name>` argument that isolates browser work per name on every backend. Each name gets its own harness daemon (its own IPC socket, log, and state), and on cloud backends its own browser — so parallel subagents or simultaneous chats no longer clobber a single shared connection. Omitting `session` uses the shared default daemon, which is fine for one-at-a-time browsing.
 
+For shared local/CDP Chrome, optional task-owned tab cleanup gives each task an
+automatic session and closes its created tabs (including popup descendants)
+when the task finishes:
+
+```yaml
+browser:
+  close_task_tabs_on_cleanup: true
+```
+
+This is off by default for backward compatibility. When enabled, explicit
+`session=<name>` values remain logical labels but are physically namespaced by
+task, so two concurrent tasks cannot share one harness daemon. Shared-browser
+cleanup requires Browser Harness 0.1.9 or newer, whose named daemons own a
+dedicated target. It never closes Chrome itself, tabs that existed before the
+task, or tabs owned by another task or session. Tabs remain available across
+multiple `browser_exec` calls within the same task; cleanup runs only when that
+task ends.
+
 To opt out and force the built-in browser tools, use `/browser use off`, or:
 
 ```yaml

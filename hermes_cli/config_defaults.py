@@ -449,6 +449,10 @@ DEFAULT_CONFIG = {
         # "off"         — force the built-in browser tools
         #                 (browser_navigate, browser_click, …)
         "backend": "",
+        # Opt in to per-task ownership tracking for Browser Use on shared
+        # local/CDP Chrome. At turn end, only pages created by that task (and
+        # their popup descendants) are closed; pre-existing tabs remain open.
+        "close_task_tabs_on_cleanup": False,
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos

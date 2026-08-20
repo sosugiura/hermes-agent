@@ -8708,6 +8708,18 @@ class AIAgent:
             raise
         finally:
             try:
+                from tools.browser_use_cli import cleanup_browser_use_task
+
+                cleanup_browser_use_task(effective_task_id)
+            except BaseException:
+                # Browser cleanup is optional hygiene. It must never replace a
+                # successful result, the conversation's original exception,
+                # or an interrupt/cancellation.
+                logger.warning(
+                    "Browser Use task-tab cleanup failed",
+                    exc_info=True,
+                )
+            try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
                         relay_turn,

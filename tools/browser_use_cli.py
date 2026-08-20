@@ -4,12 +4,14 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +31,12 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # browser, or a named Browser Use cloud browser). Popped before the
 # subprocess launches — never exported to the CLI.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
+_OWNED_TARGETS_ENV = "HERMES_BU_OWNED_TARGETS_FILE"
+_TARGET_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_TASK_BROWSER_SESSIONS: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_TASK_BROWSER_SESSIONS_LOCK = threading.Lock()
+_CLI_DEDICATED_TARGET_SUPPORT: Dict[Tuple[str, ...], bool] = {}
+_CLI_DEDICATED_TARGET_SUPPORT_LOCK = threading.Lock()
 
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
@@ -70,6 +78,238 @@ def _hermes_ensure_own_tab():
         pass
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
+"""
+
+# Opt-in task ownership preamble for shared local/CDP browsers. Dynamic values
+# travel through a private env var, never through source interpolation.
+_OWNED_TAB_PREAMBLE = """\
+# hermes: track tabs owned by this task on a shared browser
+import os as _hermes_os, re as _hermes_re
+_hermes_owned_path = _hermes_os.environ.get("HERMES_BU_OWNED_TARGETS_FILE", "")
+_hermes_generation_path = _hermes_owned_path + ".daemon" if _hermes_owned_path else ""
+_hermes_target_re = _hermes_re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+def _hermes_append_line(path, value):
+    try:
+        _flags = _hermes_os.O_WRONLY | _hermes_os.O_CREAT | _hermes_os.O_APPEND
+        if hasattr(_hermes_os, "O_NOFOLLOW"):
+            _flags |= _hermes_os.O_NOFOLLOW
+        _fd = _hermes_os.open(path, _flags, 0o600)
+        try:
+            if hasattr(_hermes_os, "fchmod"):
+                _hermes_os.fchmod(_fd, 0o600)
+            _hermes_os.write(_fd, (value + "\\n").encode("ascii"))
+        finally:
+            _hermes_os.close(_fd)
+        return True
+    except OSError:
+        return False
+def _hermes_record_target(value):
+    if isinstance(value, dict):
+        value = value.get("targetId")
+    if not isinstance(value, str) or not _hermes_target_re.fullmatch(value):
+        return False
+    return _hermes_append_line(_hermes_owned_path, value)
+def _hermes_write_generation(value):
+    if not _hermes_generation_path or not isinstance(value, int) or value <= 0:
+        return
+    try:
+        _flags = _hermes_os.O_WRONLY | _hermes_os.O_CREAT | _hermes_os.O_TRUNC
+        if hasattr(_hermes_os, "O_NOFOLLOW"):
+            _flags |= _hermes_os.O_NOFOLLOW
+        _fd = _hermes_os.open(_hermes_generation_path, _flags, 0o600)
+        try:
+            if hasattr(_hermes_os, "fchmod"):
+                _hermes_os.fchmod(_fd, 0o600)
+            _hermes_os.write(_fd, (str(value) + "\\n").encode("ascii"))
+        finally:
+            _hermes_os.close(_fd)
+    except OSError:
+        pass
+def _hermes_record_owned_descendants():
+    try:
+        with open(_hermes_owned_path, "r", encoding="ascii") as _f:
+            _owned = {
+                line.strip()
+                for line in _f.readlines(1024 * 1024)
+                if _hermes_target_re.fullmatch(line.strip())
+            }
+        _infos = _hermes_original_cdp("Target.getTargets").get("targetInfos", [])
+    except Exception:
+        return
+    _pages = {
+        info.get("targetId"): info
+        for info in _infos
+        if isinstance(info, dict)
+        and info.get("type") == "page"
+        and _hermes_target_re.fullmatch(str(info.get("targetId") or ""))
+    }
+    _lineage = set(_owned)
+    _changed = True
+    while _changed:
+        _changed = False
+        for _target_id, _info in _pages.items():
+            if _target_id not in _lineage and _info.get("openerId") in _lineage:
+                _lineage.add(_target_id)
+                _changed = True
+    for _target_id in _lineage & set(_pages):
+        _hermes_record_target(_target_id)
+_hermes_original_cdp = cdp
+def cdp(method, *args, **kwargs):
+    if method == "Target.closeTarget":
+        _hermes_record_owned_descendants()
+    _result = _hermes_original_cdp(method, *args, **kwargs)
+    if method == "Target.createTarget":
+        _hermes_record_target(_result)
+    return _result
+try:
+    _hermes_original_close_tab = close_tab
+except NameError:
+    _hermes_original_close_tab = None
+if _hermes_original_close_tab is not None:
+    def close_tab(*args, **kwargs):
+        _hermes_record_owned_descendants()
+        return _hermes_original_close_tab(*args, **kwargs)
+_hermes_original_new_tab = new_tab
+def new_tab(*args, **kwargs):
+    _result = _hermes_original_new_tab(*args, **kwargs)
+    _hermes_record_target(_result)
+    return _result
+def _hermes_daemon_pid():
+    try:
+        from browser_harness import _ipc as _hermes_ipc
+        _pid = _hermes_ipc.identify(
+            _hermes_os.environ.get("BU_NAME", ""), timeout=1.0
+        )
+    except Exception:
+        return None
+    return _pid if type(_pid) is int and _pid > 0 else None
+def _hermes_read_generation():
+    try:
+        with open(_hermes_generation_path, "r", encoding="ascii") as _f:
+            _value = _f.read(32).strip()
+        _pid = int(_value)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return _pid if _pid > 0 else None
+def _hermes_ensure_owned_root():
+    # The current tab proves ownership only on a daemon's first claim or after
+    # live IPC proves that this physical named daemon restarted. In the same
+    # daemon, task code may intentionally switch to a pre-existing/foreign tab.
+    _journal_exists = bool(
+        _hermes_owned_path and _hermes_os.path.exists(_hermes_owned_path)
+    )
+    _previous_pid = _hermes_read_generation() if _journal_exists else None
+    _current_pid = _hermes_daemon_pid()
+    if _journal_exists and not (
+        _previous_pid is not None
+        and _current_pid is not None
+        and _previous_pid != _current_pid
+    ):
+        return
+    try:
+        _current = current_tab()
+    except Exception:
+        _current = None
+    _current_id = _current.get("targetId") if isinstance(_current, dict) else None
+    # Browser Harness >= 0.1.9 guarantees a dedicated target for every
+    # non-default BU_NAME. browser_exec checks that capability before this
+    # preamble runs, so the first/restarted daemon's current target is owned.
+    if _hermes_target_re.fullmatch(str(_current_id or "")):
+        if _hermes_record_target(_current_id):
+            _hermes_write_generation(_current_pid)
+        return
+    try:
+        _result = _hermes_original_cdp("Target.createTarget", url="about:blank")
+        _tid = _result.get("targetId") if isinstance(_result, dict) else None
+        if _hermes_record_target(_tid):
+            _hermes_write_generation(_current_pid)
+        if _tid:
+            switch_tab(_tid)
+    except Exception:
+        pass
+_hermes_ensure_owned_root()
+del _hermes_ensure_owned_root
+"""
+
+def _owned_task_source(code: str) -> str:
+    """Run trusted ownership setup before compiling model-authored source."""
+    return (
+        _OWNED_TAB_PREAMBLE
+        + "\nexec(compile("
+        + repr(code)
+        + ", '<browser_exec>', 'exec'))\n"
+    )
+
+
+_OWNED_TAB_CLEANUP_CODE = """\
+# hermes: close only this task's recorded pages and popup descendants
+import os, re, time
+_path = os.environ.get("HERMES_BU_OWNED_TARGETS_FILE", "")
+_valid = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+try:
+    with open(_path, "r", encoding="ascii") as _f:
+        _owned = {line.strip() for line in _f.readlines(1024 * 1024) if _valid.fullmatch(line.strip())}
+except FileNotFoundError:
+    _owned = set()
+def _targets():
+    return cdp("Target.getTargets").get("targetInfos", [])
+def _closure(infos):
+    pages = {i.get("targetId"): i for i in infos if i.get("type") == "page" and _valid.fullmatch(str(i.get("targetId") or ""))}
+    lineage = set(_owned)
+    changed = True
+    while changed:
+        changed = False
+        for tid, info in pages.items():
+            if tid not in lineage and info.get("openerId") in lineage:
+                lineage.add(tid)
+                changed = True
+    return lineage & set(pages)
+def _close(ids):
+    for tid in ids:
+        try:
+            close_tab(tid)
+        except Exception:
+            try:
+                cdp("Target.closeTarget", targetId=tid)
+            except Exception:
+                pass
+_infos = _targets()
+_wanted = _closure(_infos)
+# Closing the harness's current target makes Browser Harness create a recovery
+# about:blank page. Park this daemon on an existing non-owned page first; this
+# only changes the daemon attachment and never mutates or closes that page.
+_parking = next(
+    (
+        i.get("targetId")
+        for i in _infos
+        if i.get("type") == "page"
+        and i.get("targetId") not in _wanted
+        and _valid.fullmatch(str(i.get("targetId") or ""))
+    ),
+    None,
+)
+if _parking:
+    try:
+        switch_tab(_parking)
+    except Exception:
+        pass
+_close(_wanted)
+_remaining = set(_wanted)
+for _ in range(5):
+    if not _remaining:
+        break
+    time.sleep(0.1)
+    _remaining &= {i.get("targetId") for i in _targets() if i.get("type") == "page"}
+if _remaining:
+    _close(_remaining)
+    for _ in range(5):
+        time.sleep(0.1)
+        _remaining &= {i.get("targetId") for i in _targets() if i.get("type") == "page"}
+        if not _remaining:
+            break
+if _remaining:
+    raise RuntimeError("owned browser targets remained after bounded cleanup")
+print("cleanup-ok")
 """
 
 _DEFAULT_TIMEOUT_S = 300
@@ -546,6 +786,232 @@ def _resolve_backend_cdp(
     return None
 
 
+def _task_tab_cleanup_enabled(task_id: Optional[str]) -> bool:
+    return bool(task_id) and is_truthy_value(
+        _read_browser_cfg().get("close_task_tabs_on_cleanup"), default=False
+    )
+
+
+def _cli_supports_dedicated_named_targets(cmd: List[str]) -> bool:
+    """True when Browser Harness guarantees one target per named daemon."""
+    key = tuple(cmd)
+    with _CLI_DEDICATED_TARGET_SUPPORT_LOCK:
+        cached = _CLI_DEDICATED_TARGET_SUPPORT.get(key)
+    if cached is not None:
+        return cached
+    supported = False
+    try:
+        proc = subprocess.run(
+            [*cmd, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_base_subprocess_env(),
+        )
+        match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", proc.stdout or "")
+        supported = bool(
+            proc.returncode == 0
+            and match
+            and tuple(int(part) for part in match.groups()) >= (0, 1, 9)
+        )
+    except Exception as exc:
+        logger.debug("Could not verify Browser Harness version: %s", exc)
+    # Cache only positive capability checks. A user can update Browser Use
+    # after a failed call and should be able to retry without restarting Hermes.
+    if supported:
+        with _CLI_DEDICATED_TARGET_SUPPORT_LOCK:
+            _CLI_DEDICATED_TARGET_SUPPORT[key] = True
+    return supported
+
+
+def _automatic_task_session(task_id: str, logical_session: str = "") -> str:
+    # Keep this short: Browser Harness embeds BU_NAME in an AF_UNIX socket
+    # path, whose macOS limit is much lower than _SESSION_RE's 64 characters.
+    material = task_id + "\0" + logical_session
+    digest = hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()[:20]
+    return f"ht-{digest}"
+
+
+def _owned_targets_path(task_id: str, session_name: str) -> Optional[str]:
+    """Return a trusted, non-user-derived state path for owned target IDs."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        root = Path(get_hermes_home()) / "cache" / "browser-use" / "ownership"
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            root.chmod(0o700)
+        except OSError:
+            pass
+        key = hashlib.sha256(
+            (task_id + "\0" + session_name).encode("utf-8", "replace")
+        ).hexdigest()
+        return str(root / f"{key}.targets")
+    except Exception as exc:
+        logger.debug("Could not prepare browser ownership state: %s", exc)
+        return None
+
+
+def _register_task_browser_session(
+    task_id: str, session_name: str, env: dict, owned_path: str
+) -> None:
+    record = {"env": dict(env), "owned_path": owned_path}
+    with _TASK_BROWSER_SESSIONS_LOCK:
+        _TASK_BROWSER_SESSIONS.setdefault(task_id, {})[session_name] = record
+
+
+def _task_cleanup_sessions(task_id: str) -> Tuple[str, ...]:
+    """Test/debug view of sessions currently registered to a task."""
+    with _TASK_BROWSER_SESSIONS_LOCK:
+        return tuple(_TASK_BROWSER_SESSIONS.get(str(task_id), {}))
+
+
+def _owned_page_target_ids(owned: set, target_infos: List[dict]) -> set:
+    """Expand recorded page IDs through the CDP opener chain."""
+    pages: Dict[str, dict] = {}
+    for info in target_infos:
+        if not isinstance(info, dict) or info.get("type") != "page":
+            continue
+        target_id = info.get("targetId")
+        if isinstance(target_id, str) and _TARGET_ID_RE.fullmatch(target_id):
+            pages[target_id] = info
+    lineage = {
+        target_id
+        for target_id in owned
+        if isinstance(target_id, str) and _TARGET_ID_RE.fullmatch(target_id)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for target_id, info in pages.items():
+            if target_id not in lineage and info.get("openerId") in lineage:
+                lineage.add(target_id)
+                changed = True
+    return lineage & set(pages)
+
+
+def _clear_owned_targets_file(path_value: str) -> bool:
+    """Remove an ownership journal, falling back to safe in-place truncation."""
+    path = Path(path_value)
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        pass
+    try:
+        flags = os.O_WRONLY | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        logger.debug("Could not clear browser ownership file", exc_info=True)
+        return False
+
+
+def cleanup_browser_use_task(task_id: Optional[str]) -> None:
+    """Best-effort close of shared-browser pages owned by one task.
+
+    Failed sessions remain registered (and their 0600 target files remain on
+    disk) so a later cleanup attempt can retry. Provider-private browsers are
+    intentionally never registered here; their existing provider lifecycle
+    remains authoritative.
+    """
+    # Registration itself is the opt-in proof. Do not re-read the config here:
+    # a failed cleanup must remain retryable even if config changes afterward.
+    if not task_id:
+        return
+    task_key = str(task_id)
+    with _TASK_BROWSER_SESSIONS_LOCK:
+        records = dict(_TASK_BROWSER_SESSIONS.get(task_key, {}))
+    if not records:
+        return
+    cmd = _find_cli()
+    if not cmd:
+        logger.warning("Browser Use task cleanup skipped: CLI unavailable")
+        return
+    succeeded = []
+    for session_name, record in records.items():
+        env = dict(record["env"])
+        env["BU_NAME"] = session_name
+        env[_OWNED_TARGETS_ENV] = record["owned_path"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=_OWNED_TAB_CLEANUP_CODE,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+            if proc.returncode != 0 or "cleanup-ok" not in (proc.stdout or ""):
+                logger.warning(
+                    "Browser Use task tab cleanup failed for session %s (exit %s)",
+                    session_name,
+                    proc.returncode,
+                )
+                continue
+            owned_path = record["owned_path"]
+            if not _clear_owned_targets_file(owned_path):
+                logger.warning(
+                    "Browser Use task tabs closed for session %s, but ownership "
+                    "state could not be cleared; retaining cleanup registration",
+                    session_name,
+                )
+                # Do not reload: that could create a replacement root while the
+                # non-empty journal still describes only the tabs just closed.
+                continue
+            try:
+                Path(owned_path + ".daemon").unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Could not remove browser daemon generation file", exc_info=True)
+            try:
+                reload_proc = subprocess.run(
+                    [*cmd, "--reload"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=env,
+                )
+            except Exception:
+                logger.warning(
+                    "Browser Use task daemon reload failed for session %s; "
+                    "owned tabs are already closed",
+                    session_name,
+                    exc_info=True,
+                )
+            else:
+                if reload_proc.returncode != 0:
+                    logger.warning(
+                        "Browser Use task daemon reload failed for session %s (exit %s); "
+                        "owned tabs are already closed",
+                        session_name,
+                        reload_proc.returncode,
+                    )
+            # Tab cleanup plus ownership-state clearing are authoritative.
+            # Retrying after a reload-only failure can make the daemon create a
+            # replacement blank target that was never recorded, then leave it.
+            succeeded.append(session_name)
+        except Exception:
+            logger.warning(
+                "Browser Use task tab cleanup failed for session %s",
+                session_name,
+                exc_info=True,
+            )
+    if succeeded:
+        with _TASK_BROWSER_SESSIONS_LOCK:
+            current = _TASK_BROWSER_SESSIONS.get(task_key, {})
+            for session_name in succeeded:
+                current.pop(session_name, None)
+            if not current:
+                _TASK_BROWSER_SESSIONS.pop(task_key, None)
+
+
 def browser_exec(
     code: str,
     session: str = "",
@@ -571,6 +1037,12 @@ def browser_exec(
             "to verify the setup."
         )
 
+    cleanup_enabled = _task_tab_cleanup_enabled(task_id)
+    if cleanup_enabled:
+        # The caller's session is a logical label only. Physical BU_NAME must
+        # include task_id so two concurrent tasks can never share one daemon.
+        session = _automatic_task_session(str(task_id), session)
+
     env = _base_subprocess_env()
     if session:
         if not _SESSION_RE.match(session):
@@ -591,13 +1063,23 @@ def browser_exec(
     if backend_err:
         return tool_error(backend_err)
 
-    # On a SHARED browser (local Chrome / CDP override) a fresh named daemon
-    # attaches to the first existing page — the same page a sibling daemon
-    # may hold. Pin each named session to a tab it created before running
-    # the model's code. Private per-name browsers (provider-keyed or BU
-    # cloud) skip this: no one to collide with, and the extra tab would leak.
+    # On a SHARED browser (local Chrome / CDP override), use only Browser
+    # Harness versions that guarantee one dedicated target per named daemon.
+    # Private per-name browsers skip this ownership layer.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
+    owned_path = None
+    if cleanup_enabled and not private_browser:
+        if not _cli_supports_dedicated_named_targets(cmd):
+            return tool_error(
+                "Task-owned browser tab cleanup requires Browser Harness "
+                "0.1.9 or newer so every named daemon has a dedicated tab. "
+                "Update Browser Use with `browser-use --update -y` and retry."
+            )
+        owned_path = _owned_targets_path(str(task_id), session)
+        if owned_path:
+            env[_OWNED_TARGETS_ENV] = owned_path
+            code = _owned_task_source(code)
+    elif session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -608,6 +1090,9 @@ def browser_exec(
     # local Chrome/CDP endpoint is reachable (their API key authenticates it)
     if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
         env["BU_AUTOSPAWN"] = "1"
+
+    if owned_path:
+        _register_task_browser_session(str(task_id), session, env, owned_path)
 
     try:
         timeout = max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S))

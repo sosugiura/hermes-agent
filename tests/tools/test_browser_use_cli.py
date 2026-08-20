@@ -14,7 +14,10 @@ Covers the three seams the integration relies on:
 import json
 import os
 import stat
+import sys
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,7 +29,15 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    with bu_cli._TASK_BROWSER_SESSIONS_LOCK:
+        bu_cli._TASK_BROWSER_SESSIONS.clear()
+    with bu_cli._CLI_DEDICATED_TARGET_SUPPORT_LOCK:
+        bu_cli._CLI_DEDICATED_TARGET_SUPPORT.clear()
     yield
+    with bu_cli._TASK_BROWSER_SESSIONS_LOCK:
+        bu_cli._TASK_BROWSER_SESSIONS.clear()
+    with bu_cli._CLI_DEDICATED_TARGET_SUPPORT_LOCK:
+        bu_cli._CLI_DEDICATED_TARGET_SUPPORT.clear()
 
 
 def _fake_cli(tmp_path, body):
@@ -518,6 +529,653 @@ class TestOwnTabPreamble:
         ast.parse(bu_cli._OWN_TAB_PREAMBLE)
         # and composes with model code
         ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
+
+
+class TestTaskOwnedTabCleanup:
+    def _enable(self, monkeypatch, enabled=True):
+        monkeypatch.setattr(
+            bu_cli,
+            "_read_browser_cfg",
+            lambda: {"close_task_tabs_on_cleanup": enabled},
+        )
+        monkeypatch.setattr(
+            bu_cli,
+            "_cli_supports_dedicated_named_targets",
+            lambda _cmd: True,
+        )
+
+    def _shared_backend(self, monkeypatch):
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+
+    def test_cli_capability_gate_accepts_and_caches_supported_version(
+        self, monkeypatch
+    ):
+        calls = []
+
+        class Proc:
+            returncode = 0
+            stdout = "browser-harness 0.1.9\n"
+
+        def fake_run(argv, **_kwargs):
+            calls.append(argv)
+            return Proc()
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+
+        assert bu_cli._cli_supports_dedicated_named_targets(["browser-use"])
+        assert bu_cli._cli_supports_dedicated_named_targets(["browser-use"])
+        assert calls == [["browser-use", "--version"]]
+
+    def test_cli_capability_gate_does_not_cache_unsupported_version(
+        self, monkeypatch
+    ):
+        versions = iter(["0.1.8\n", "0.1.9\n"])
+
+        class Proc:
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = next(versions)
+
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: Proc(),
+        )
+
+        assert not bu_cli._cli_supports_dedicated_named_targets(["browser-use"])
+        assert bu_cli._cli_supports_dedicated_named_targets(["browser-use"])
+
+    def test_unsupported_cli_fails_closed_before_browser_execution(
+        self, tmp_path, monkeypatch
+    ):
+        self._enable(monkeypatch)
+        self._shared_backend(monkeypatch)
+        cli = _fake_cli(tmp_path, "exit 99\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(
+            bu_cli,
+            "_cli_supports_dedicated_named_targets",
+            lambda _cmd: False,
+        )
+
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="task-a"))
+
+        assert "0.1.9 or newer" in result["error"]
+
+
+    def test_opt_out_keeps_unnamed_shared_default(self, tmp_path, monkeypatch):
+        self._enable(monkeypatch, False)
+        self._shared_backend(monkeypatch)
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:[${BU_NAME}]"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="task-a"))
+
+        assert "bu:[]" in result["output"]
+        assert "session" not in result
+
+    def test_opt_in_auto_session_is_stable_per_task_and_distinct(self, tmp_path, monkeypatch):
+        self._enable(monkeypatch)
+        self._shared_backend(monkeypatch)
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        a1 = json.loads(bu_cli.browser_exec("print(1)", task_id="task-a"))
+        a2 = json.loads(bu_cli.browser_exec("print(2)", task_id="task-a"))
+        b = json.loads(bu_cli.browser_exec("print(3)", task_id="task-b"))
+
+        assert a1["session"] == a2["session"]
+        assert a1["session"] != b["session"]
+        assert bu_cli._SESSION_RE.fullmatch(a1["session"])
+        # Browser Harness embeds BU_NAME in an AF_UNIX socket path on macOS.
+        assert len(a1["session"]) <= 24
+
+    def test_explicit_session_is_physically_scoped_per_task(self, tmp_path, monkeypatch):
+        self._enable(monkeypatch)
+        self._shared_backend(monkeypatch)
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        a = json.loads(
+            bu_cli.browser_exec("print(1)", session="research", task_id="task-a")
+        )
+        b = json.loads(
+            bu_cli.browser_exec("print(1)", session="research", task_id="task-b")
+        )
+
+        assert a["session"].startswith("ht-")
+        assert b["session"].startswith("ht-")
+        assert a["session"] != b["session"]
+        assert bu_cli._task_cleanup_sessions("task-a") == (a["session"],)
+        assert bu_cli._task_cleanup_sessions("task-b") == (b["session"],)
+
+    def test_owned_preamble_is_shared_only(self, tmp_path, monkeypatch):
+        self._enable(monkeypatch)
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        self._shared_backend(monkeypatch)
+        shared = json.loads(bu_cli.browser_exec("print(1)", task_id="task-a"))
+        assert "_hermes_record_target" in shared["output"]
+
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(bt, "_get_session_info", lambda key: {"cdp_url": "wss://private/" + key})
+        private = json.loads(bu_cli.browser_exec("print(1)", task_id="task-b"))
+        assert "_hermes_record_target" not in private["output"]
+
+    def test_owned_preamble_records_root_before_user_syntax_error(
+        self, tmp_path, monkeypatch
+    ):
+        self._enable(monkeypatch)
+        self._shared_backend(monkeypatch)
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        result = json.loads(bu_cli.browser_exec("if:", task_id="syntax-task"))
+        owned = Path(
+            bu_cli._owned_targets_path("syntax-task", result["session"])
+        )
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        namespace = {
+            "cdp": lambda *_args, **_kwargs: None,
+            "new_tab": lambda *_args, **_kwargs: None,
+            "current_tab": lambda: {"targetId": "syntax-root"},
+            "switch_tab": lambda _target: None,
+        }
+
+        # The submitted wrapper itself must compile so the trusted ownership
+        # preamble executes before the model-authored source is compiled.
+        compiled = compile(result["output"], "<browser-use-input>", "exec")
+        with pytest.raises(SyntaxError):
+            exec(compiled, namespace)
+
+        assert owned.read_text().splitlines() == ["syntax-root"]
+
+    def test_owned_preamble_records_root_new_tab_and_create_target(self, tmp_path, monkeypatch):
+        owned = tmp_path / "owned.targets"
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setenv("BU_NAME", "preamble-contract")
+
+        def fake_cdp(method, **_kwargs):
+            assert method == "Target.createTarget"
+            return {"targetId": "cdp-created-id"}
+
+        namespace = {
+            "cdp": fake_cdp,
+            "new_tab": lambda *_a, **_k: "new-tab-id",
+            "current_tab": lambda: {
+                "targetId": "dedicated-root",
+                "url": "about:blank",
+            },
+            "switch_tab": lambda _target: None,
+        }
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace)
+        namespace["new_tab"]("https://example.com")
+        namespace["cdp"]("Target.createTarget", url="about:blank")
+
+        assert owned.read_text().splitlines() == [
+            "dedicated-root",
+            "new-tab-id",
+            "cdp-created-id",
+        ]
+        assert stat.S_IMODE(owned.stat().st_mode) == 0o600
+
+    def test_owned_preamble_reuses_new_harness_current_without_extra_root(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+
+        def unexpected_cdp(*_args, **_kwargs):
+            raise AssertionError("must not create a second root")
+
+        namespace = {
+            "cdp": unexpected_cdp,
+            "new_tab": lambda *_a, **_k: None,
+            "current_tab": lambda: {
+                "targetId": "harness-current",
+                "url": "about:blank",
+            },
+            "switch_tab": lambda _target: None,
+        }
+
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace)
+
+        assert owned.read_text().splitlines() == ["harness-current"]
+
+    def test_owned_preamble_records_target_without_fchmod(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.delattr(os, "fchmod", raising=False)
+
+        namespace = {
+            "cdp": lambda *_args, **_kwargs: None,
+            "new_tab": lambda *_args, **_kwargs: None,
+            "current_tab": lambda: {"targetId": "windows-root"},
+            "switch_tab": lambda _target: None,
+        }
+
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace)
+
+        assert owned.read_text().splitlines() == ["windows-root"]
+
+    @pytest.mark.parametrize("closer", ["cdp", "close_tab"])
+    def test_owned_preamble_records_descendants_before_owned_root_close(
+        self, tmp_path, monkeypatch, closer
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("root\n")
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        targets = [
+            {"targetId": "root", "type": "page"},
+            {"targetId": "popup", "type": "page", "openerId": "root"},
+            {"targetId": "nested", "type": "page", "openerId": "popup"},
+            {"targetId": "sibling", "type": "page"},
+        ]
+
+        def remove_target(target_id):
+            targets[:] = [t for t in targets if t["targetId"] != target_id]
+            # Real Chrome drops a popup's openerId after its opener closes.
+            for target in targets:
+                if target.get("openerId") == target_id:
+                    target.pop("openerId")
+
+        def original_cdp(method, **kwargs):
+            if method == "Target.getTargets":
+                return {"targetInfos": [dict(target) for target in targets]}
+            if method == "Target.closeTarget":
+                remove_target(kwargs["targetId"])
+                return {"success": True}
+            raise AssertionError(method)
+
+        namespace = {
+            "cdp": original_cdp,
+            "close_tab": remove_target,
+            "new_tab": lambda *_args, **_kwargs: None,
+            "current_tab": lambda: {"targetId": "root"},
+            "switch_tab": lambda _target: None,
+        }
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace)
+
+        if closer == "cdp":
+            namespace["cdp"]("Target.closeTarget", targetId="root")
+        else:
+            namespace["close_tab"]("root")
+
+        recorded = set(owned.read_text().splitlines())
+        assert {"root", "popup", "nested"} <= recorded
+        assert "sibling" not in recorded
+        assert next(t for t in targets if t["targetId"] == "popup").get("openerId") is None
+
+        exec(bu_cli._OWNED_TAB_CLEANUP_CODE, namespace)
+
+        assert {t["targetId"] for t in targets} == {"sibling"}
+
+    def test_owned_preamble_claims_fresh_daemon_root_after_task_id_reuse(
+        self, tmp_path, monkeypatch
+    ):
+        """Successful cleanup removes the ownership file. Reusing a caller-
+        supplied task id must therefore claim the replacement daemon's new
+        dedicated root."""
+        owned = tmp_path / "owned.targets"
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setenv("BU_NAME", "reused-task")
+        current = iter(["first-root", "second-root"])
+
+        def namespace():
+            return {
+                "cdp": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("dedicated current target must be reused")
+                ),
+                "new_tab": lambda *_a, **_k: None,
+                "current_tab": lambda: {
+                    "targetId": next(current),
+                    "url": "about:blank",
+                },
+                "switch_tab": lambda _target: None,
+            }
+
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace())
+        assert owned.read_text().splitlines() == ["first-root"]
+
+        # cleanup_browser_use_task() removes this file on success.
+        owned.unlink()
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace())
+
+        assert owned.read_text().splitlines() == ["second-root"]
+
+    def test_owned_preamble_does_not_claim_switched_tab_in_same_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("owned-root\n")
+        Path(str(owned) + ".daemon").write_text("101\n")
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setenv("BU_NAME", "same-daemon")
+        monkeypatch.setitem(
+            sys.modules,
+            "browser_harness",
+            SimpleNamespace(
+                _ipc=SimpleNamespace(identify=lambda *_args, **_kwargs: 101)
+            ),
+        )
+        namespace = {
+            "cdp": lambda *_args, **_kwargs: None,
+            "new_tab": lambda *_args, **_kwargs: None,
+            "current_tab": lambda: {"targetId": "preexisting-switched-tab"},
+            "switch_tab": lambda _target: None,
+        }
+
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace)
+
+        assert owned.read_text().splitlines() == ["owned-root"]
+
+    def test_owned_preamble_claims_restarted_daemon_root_with_stale_file(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("old-root\n")
+        Path(str(owned) + ".daemon").write_text("101\n")
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setenv("BU_NAME", "restarted-daemon")
+        monkeypatch.setitem(
+            sys.modules,
+            "browser_harness",
+            SimpleNamespace(
+                _ipc=SimpleNamespace(identify=lambda *_args, **_kwargs: 202)
+            ),
+        )
+        namespace = {
+            "cdp": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("dedicated current target must be reused")
+            ),
+            "new_tab": lambda *_args, **_kwargs: None,
+            "current_tab": lambda: {"targetId": "replacement-root"},
+            "switch_tab": lambda _target: None,
+        }
+
+        exec(bu_cli._OWNED_TAB_PREAMBLE, namespace)
+
+        assert owned.read_text().splitlines() == ["old-root", "replacement-root"]
+
+    def test_opener_closure_includes_descendants_not_siblings(self):
+        targets = [
+            {"targetId": "root", "type": "page"},
+            {"targetId": "popup", "type": "page", "openerId": "root"},
+            {"targetId": "nested", "type": "page", "openerId": "popup"},
+            {"targetId": "sibling", "type": "page"},
+            {"targetId": "worker", "type": "service_worker", "openerId": "root"},
+        ]
+
+        assert bu_cli._owned_page_target_ids({"root"}, targets) == {
+            "root",
+            "popup",
+            "nested",
+        }
+
+    def test_opener_closure_keeps_missing_owned_root_as_lineage_anchor(self):
+        targets = [
+            {"targetId": "popup", "type": "page", "openerId": "closed-root"},
+            {"targetId": "nested", "type": "page", "openerId": "popup"},
+            {"targetId": "sibling", "type": "page"},
+        ]
+
+        assert bu_cli._owned_page_target_ids({"closed-root"}, targets) == {
+            "popup",
+            "nested",
+        }
+
+    def test_cleanup_code_closes_owned_chain_retries_and_keeps_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("root\n")
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        targets = [
+            {"targetId": "root", "type": "page"},
+            {"targetId": "popup", "type": "page", "openerId": "root"},
+            {"targetId": "nested", "type": "page", "openerId": "popup"},
+            {"targetId": "sibling", "type": "page"},
+        ]
+        attempts = {}
+        switched = []
+
+        def close_tab(target_id):
+            attempts[target_id] = attempts.get(target_id, 0) + 1
+            # Model the observed Chrome lag: first close request is accepted
+            # but still visible; the one bounded retry removes it.
+            if attempts[target_id] >= 2:
+                targets[:] = [t for t in targets if t["targetId"] != target_id]
+
+        def cdp(method, **kwargs):
+            if method == "Target.getTargets":
+                return {"targetInfos": list(targets)}
+            if method == "Target.closeTarget":
+                close_tab(kwargs["targetId"])
+                return {"success": True}
+            raise AssertionError(method)
+
+        exec(
+            bu_cli._OWNED_TAB_CLEANUP_CODE,
+            {
+                "cdp": cdp,
+                "close_tab": close_tab,
+                "switch_tab": switched.append,
+            },
+        )
+
+        assert {t["targetId"] for t in targets} == {"sibling"}
+        assert attempts == {"root": 2, "popup": 2, "nested": 2}
+        assert switched == ["sibling"]
+
+    def test_cleanup_code_closes_popup_chain_after_owned_root_was_closed(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("closed-root\n")
+        monkeypatch.setenv("HERMES_BU_OWNED_TARGETS_FILE", str(owned))
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        targets = [
+            {"targetId": "popup", "type": "page", "openerId": "closed-root"},
+            {"targetId": "nested", "type": "page", "openerId": "popup"},
+            {"targetId": "sibling", "type": "page"},
+        ]
+        attempts = {}
+        switched = []
+
+        def close_tab(target_id):
+            attempts[target_id] = attempts.get(target_id, 0) + 1
+            if attempts[target_id] >= 2:
+                targets[:] = [t for t in targets if t["targetId"] != target_id]
+
+        def cdp(method, **kwargs):
+            if method == "Target.getTargets":
+                return {"targetInfos": list(targets)}
+            if method == "Target.closeTarget":
+                close_tab(kwargs["targetId"])
+                return {"success": True}
+            raise AssertionError(method)
+
+        exec(
+            bu_cli._OWNED_TAB_CLEANUP_CODE,
+            {
+                "cdp": cdp,
+                "close_tab": close_tab,
+                "switch_tab": switched.append,
+            },
+        )
+
+        assert {t["targetId"] for t in targets} == {"sibling"}
+        assert attempts == {"popup": 2, "nested": 2}
+        assert switched == ["sibling"]
+
+    def test_cleanup_uses_argv_env_and_retries_async_close(self, tmp_path, monkeypatch):
+        self._enable(monkeypatch)
+        self._shared_backend(monkeypatch)
+        calls = []
+
+        class Proc:
+            returncode = 0
+            stdout = "cleanup-ok\n"
+            stderr = ""
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda argv, **kwargs: calls.append((argv, kwargs)) or Proc(),
+        )
+        bu_cli.browser_exec("print(1)", task_id="task;$(unsafe)")
+        calls.clear()
+
+        bu_cli.cleanup_browser_use_task("task;$(unsafe)")
+
+        assert len(calls) == 2
+        argv, kwargs = calls[0]
+        assert argv == ["browser-use"]
+        assert kwargs["input"] == bu_cli._OWNED_TAB_CLEANUP_CODE
+        assert "task;$(unsafe)" not in kwargs["input"]
+        assert "time.sleep" in kwargs["input"]
+        assert "remaining" in kwargs["input"]
+        assert Path(kwargs["env"]["HERMES_BU_OWNED_TARGETS_FILE"]).name.endswith(".targets")
+        reload_argv, reload_kwargs = calls[1]
+        assert reload_argv == ["browser-use", "--reload"]
+        assert reload_kwargs["env"]["BU_NAME"].startswith("ht-")
+
+    def test_cleanup_failure_is_best_effort_and_retryable(self, tmp_path, monkeypatch):
+        self._enable(monkeypatch)
+        self._shared_backend(monkeypatch)
+        cli = _fake_cli(tmp_path, "cat > /dev/null\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        bu_cli.browser_exec("print(1)", task_id="task-a")
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("cleanup unavailable")),
+        )
+
+        bu_cli.cleanup_browser_use_task("task-a")
+
+        assert bu_cli._task_cleanup_sessions("task-a")
+
+    def test_ownership_file_unlink_falls_back_to_truncate(self, tmp_path, monkeypatch):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("root\n")
+        monkeypatch.setattr(
+            Path,
+            "unlink",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("busy")),
+        )
+
+        assert bu_cli._clear_owned_targets_file(str(owned)) is True
+        assert owned.read_text() == ""
+
+    def test_ownership_clear_failure_keeps_registration_and_skips_reload(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("root\n")
+        bu_cli._register_task_browser_session(
+            "task-a", "research", {}, str(owned)
+        )
+
+        class Proc:
+            returncode = 0
+            stdout = "cleanup-ok\n"
+            stderr = ""
+
+        calls = []
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or Proc(),
+        )
+        monkeypatch.setattr(
+            bu_cli, "_clear_owned_targets_file", lambda _path: False
+        )
+
+        bu_cli.cleanup_browser_use_task("task-a")
+
+        assert len(calls) == 1
+        assert bu_cli._task_cleanup_sessions("task-a") == ("research",)
+
+    def test_daemon_reload_failure_releases_completed_tab_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("root\n")
+        generation = Path(str(owned) + ".daemon")
+        generation.write_text("101\n")
+        bu_cli._register_task_browser_session(
+            "task-a",
+            "research",
+            {},
+            str(owned),
+        )
+
+        class Proc:
+            def __init__(self, returncode, stdout=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = ""
+
+        results = iter([Proc(0, "cleanup-ok\n"), Proc(1)])
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: next(results),
+        )
+
+        bu_cli.cleanup_browser_use_task("task-a")
+
+        assert bu_cli._task_cleanup_sessions("task-a") == ()
+        assert not owned.exists()
+        assert not generation.exists()
+
+    def test_daemon_reload_exception_releases_completed_tab_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        owned = tmp_path / "owned.targets"
+        owned.write_text("root\n")
+        bu_cli._register_task_browser_session(
+            "task-a",
+            "research",
+            {},
+            str(owned),
+        )
+
+        class Proc:
+            returncode = 0
+            stdout = "cleanup-ok\n"
+            stderr = ""
+
+        calls = 0
+
+        def fake_run(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return Proc()
+            raise bu_cli.subprocess.TimeoutExpired("browser-use --reload", 10)
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+
+        bu_cli.cleanup_browser_use_task("task-a")
+
+        assert bu_cli._task_cleanup_sessions("task-a") == ()
+        assert not owned.exists()
 
 
 class TestProviderPickerIntegration:

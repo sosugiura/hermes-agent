@@ -196,6 +196,52 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
     assert db.events == []
 
 
+def test_run_conversation_cleans_browser_task_once_on_success(monkeypatch):
+    db = _DB(session_exists=False)
+    agent = _agent_with_db(db, session_id="fresh")
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda *_a, **_k: {"final_response": "ok", "messages": [], "failed": False},
+    )
+    cleaned = []
+
+    def cleanup(task_id):
+        cleaned.append(task_id)
+        raise RuntimeError("best-effort cleanup failure")
+
+    monkeypatch.setattr("tools.browser_use_cli.cleanup_browser_use_task", cleanup)
+
+    result = AIAgent.run_conversation(agent, "work", task_id="task-success")
+
+    assert result["final_response"] == "ok"
+    assert cleaned == ["task-success"]
+
+
+def test_run_conversation_cleanup_failure_does_not_replace_original_exception(monkeypatch):
+    db = _DB(session_exists=False)
+    agent = _agent_with_db(db, session_id="fresh")
+
+    def original(*_a, **_k):
+        raise ValueError("original failure")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", original)
+    cleaned = []
+
+    def cleanup(task_id):
+        cleaned.append(task_id)
+        raise RuntimeError("cleanup failure")
+
+    monkeypatch.setattr("tools.browser_use_cli.cleanup_browser_use_task", cleanup)
+
+    try:
+        AIAgent.run_conversation(agent, "work", task_id="task-failure")
+    except ValueError as exc:
+        assert str(exc) == "original failure"
+    else:
+        raise AssertionError("original exception must propagate")
+    assert cleaned == ["task-failure"]
+
+
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
     db = _DB(acquire_result=False)
     agent = _agent_with_db(db)
