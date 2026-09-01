@@ -7357,8 +7357,30 @@ class DiscordAdapter(BasePlatformAdapter):
                     if attempt == 0:
                         # Brief backoff before the second attempt — most failures
                         # in this path are transient connect errors that recover
-                        # within a second or two.
-                        await asyncio.sleep(0.75)
+                        # within a second or two. But if Discord told us this was
+                        # a rate limit with a structured `retry_after`, honor that
+                        # instead: retrying a 429 after only 0.75s just re-hits
+                        # the same rate limit and burns the retry for nothing (#20243).
+                        retry_delays = []
+                        for error in (fallback_error, direct_error):
+                            if not self._is_discord_rate_limit(error):
+                                continue
+                            raw_retry_after = getattr(error, "retry_after", None)
+                            if raw_retry_after is not None:
+                                try:
+                                    candidate = float(raw_retry_after)
+                                except (TypeError, ValueError):
+                                    candidate = None
+                            else:
+                                candidate = self._extract_discord_retry_after(error)
+                            if (
+                                candidate is not None
+                                and math.isfinite(candidate)
+                                and candidate > 0
+                            ):
+                                retry_delays.append(candidate)
+                        retry_after = max(retry_delays, default=None)
+                        await asyncio.sleep(retry_after if retry_after is not None else 0.75)
                         continue
 
         logger.warning(

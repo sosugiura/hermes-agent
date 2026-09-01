@@ -428,6 +428,145 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
 
 
 @pytest.mark.asyncio
+async def test_auto_create_thread_honors_discord_retry_after_on_retry(adapter, monkeypatch):
+    """When Discord signals a structured rate-limit ``retry_after``, the
+    single retry's backoff must honor it instead of the fixed 0.75s delay.
+
+    Regression guard: production saw Discord reject auto-thread creation
+    with ``Too many requests. Retry in 39.99 seconds.`` (and separately
+    172s) — retrying after only 0.75s just re-hit the same rate limit and
+    the message was silently dropped.
+    """
+    import asyncio
+
+    class RateLimited(Exception):
+        def __init__(self, retry_after):
+            super().__init__(f"Too many requests. Retry in {retry_after} seconds.")
+            self.retry_after = retry_after
+
+    thread = SimpleNamespace(id=999, name="help")
+    seed_msg = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    message = SimpleNamespace(
+        content="please help",
+        create_thread=AsyncMock(side_effect=RateLimited(39.99)),
+        channel=SimpleNamespace(send=AsyncMock(side_effect=[RateLimited(39.99), seed_msg])),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    assert sleep_calls == [39.99]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_uses_longest_discord_retry_after(adapter, monkeypatch):
+    """The retry must satisfy both the direct and fallback Discord buckets."""
+    import asyncio
+
+    class RateLimited(Exception):
+        def __init__(self, retry_after):
+            super().__init__("Too many requests.")
+            self.retry_after = retry_after
+
+    thread = SimpleNamespace(id=999, name="help")
+    message = SimpleNamespace(
+        content="please help",
+        create_thread=AsyncMock(side_effect=[RateLimited(172.04), thread]),
+        channel=SimpleNamespace(send=AsyncMock(side_effect=RateLimited(171.65))),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    assert sleep_calls == [172.04]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_honors_retry_after_header(adapter, monkeypatch):
+    """HTTP 429 response headers are honored when no exception attribute exists."""
+    import asyncio
+
+    class RateLimitedHTTPError(Exception):
+        def __init__(self, retry_after):
+            super().__init__("rate limited")
+            self.response = SimpleNamespace(
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    thread = SimpleNamespace(id=999, name="help")
+    message = SimpleNamespace(
+        content="please help",
+        create_thread=AsyncMock(side_effect=[RateLimitedHTTPError(39.99), thread]),
+        channel=SimpleNamespace(send=AsyncMock(side_effect=RateLimitedHTTPError(39.66))),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    assert sleep_calls == [39.99]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_retry_after", [0, -1, float("inf"), float("nan"), "invalid"])
+async def test_auto_create_thread_falls_back_to_default_delay_for_invalid_retry_after(
+    adapter, monkeypatch, invalid_retry_after
+):
+    """Malformed, non-positive, or non-finite delay signals are ignored."""
+    import asyncio
+
+    class RateLimited(Exception):
+        def __init__(self, retry_after):
+            super().__init__("Too many requests.")
+            self.retry_after = retry_after
+
+    thread = SimpleNamespace(id=999, name="help")
+    seed_msg = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    message = SimpleNamespace(
+        content="please help",
+        create_thread=AsyncMock(side_effect=RateLimited(invalid_retry_after)),
+        channel=SimpleNamespace(
+            send=AsyncMock(side_effect=[RateLimited(invalid_retry_after), seed_msg])
+        ),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    assert sleep_calls == [0.75]
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     thread = SimpleNamespace(
         id=999,
