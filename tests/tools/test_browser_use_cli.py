@@ -1317,6 +1317,38 @@ class TestNativeScreenshots:
         out = f"{stale}\n/nonexistent/dir/x.png\n"
         assert bu_cli._find_screenshot(out, since=time.time()) is None
 
+    def test_find_screenshot_does_not_use_unbounded_regex(self, tmp_path, monkeypatch):
+        shot = self._shot(tmp_path)
+
+        class RegexMustNotRun:
+            def findall(self, _text):
+                raise AssertionError("unbounded screenshot regex was used")
+
+        monkeypatch.setattr(bu_cli, "_IMAGE_PATH_RE", RegexMustNotRun())
+        noisy = ("https://example.test/not-an-image " * 100_000) + f"saved:{shot};"
+        assert bu_cli._find_screenshot(noisy, since=time.time() - 5) == shot
+
+    def test_find_screenshot_scan_is_tail_bounded(self, tmp_path):
+        shot = self._shot(tmp_path)
+        noise = "x" * (bu_cli._SCREENSHOT_SCAN_TAIL_CHARS + 1)
+        assert bu_cli._find_screenshot(f"{shot}\n{noise}", since=time.time() - 5) is None
+
+    def test_find_screenshot_handles_pathological_slash_token(self):
+        out = "/segment" * 100_000
+        assert bu_cli._find_screenshot(out, since=time.time()) is None
+
+    def test_find_screenshot_accepts_windows_path(self, monkeypatch):
+        path = r"C:\Users\u\shots\page.png"
+        monkeypatch.setattr(os.path, "isfile", lambda candidate: candidate == path)
+        monkeypatch.setattr(os.path, "getmtime", lambda _candidate: time.time())
+        assert bu_cli._find_screenshot(f"saved:{path};", since=time.time() - 5) == path
+
+    def test_find_screenshot_preserves_first_extension_match(self, monkeypatch):
+        path = "/tmp/notes.png"
+        monkeypatch.setattr(os.path, "isfile", lambda candidate: candidate == path)
+        monkeypatch.setattr(os.path, "getmtime", lambda _candidate: time.time())
+        assert bu_cli._find_screenshot(f"{path}.bak.jpg", since=time.time() - 5) == path
+
     def test_vision_model_gets_multimodal_envelope(self, tmp_path, monkeypatch):
         shot = self._shot(tmp_path)
         cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "{shot}"\n')

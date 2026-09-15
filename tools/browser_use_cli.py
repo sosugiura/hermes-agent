@@ -329,6 +329,18 @@ _IMAGE_PATH_RE = re.compile(
     r"((?:[A-Za-z]:[\\/]|/)[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE
 )
 
+# Screenshot discovery runs synchronously in a gateway worker after the
+# browser-use subprocess exits.  Keep the scan bounded: third-party CLI output
+# can contain megabytes of URLs/DOM paths, and the legacy unanchored regex above
+# retried from every slash when no image suffix followed (quadratic worst case,
+# holding the GIL for minutes).  One MiB is far beyond a normal printed path but
+# still gives the gateway a fixed upper bound.  A screenshot printed earlier
+# than this tail is intentionally not attached rather than risking gateway
+# starvation.  The regex remains exported for compatibility with callers/tests
+# that validate its cross-platform syntax.
+_SCREENSHOT_SCAN_TAIL_CHARS = 1024 * 1024
+_IMAGE_SUFFIXES = (".jpeg", ".webp", ".png", ".jpg")
+
 # http(s) URL literals in exec code checked against browser_navigate's policy
 _URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
 
@@ -641,9 +653,45 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Return the last screenshot path printed during this exec, or None.
 
-    Only accepts files that exist and were written after the exec started
+    Only accepts files that exist and were written after the exec started.
+    Candidate extraction is a bounded linear scan rather than an unanchored
+    regex over arbitrary third-party stdout.
     """
-    for path in reversed(_IMAGE_PATH_RE.findall(stdout or "")):
+    tail = (stdout or "")[-_SCREENSHOT_SCAN_TAIL_CHARS:]
+    # capture_screenshot() prints an unquoted absolute path.  Reverse tokens so
+    # the most recent printed screenshot wins, matching the previous behavior.
+    for raw_token in reversed(tail.split()):
+        token = raw_token.strip("\"'()[]{}<>,;")
+        # A path may follow prose punctuation ("saved:/tmp/x.png") or use a
+        # Windows drive prefix. Find the first absolute-path marker once.
+        path_start = token.find("/")
+        for index in range(max(0, len(token) - 2)):
+            if (
+                token[index].isalpha()
+                and (index == 0 or not token[index - 1].isalnum())
+                and token[index + 1] == ":"
+                and token[index + 2] in "\\/"
+            ):
+                if path_start < 0 or index < path_start:
+                    path_start = index
+                break
+        if path_start < 0:
+            continue
+
+        # Preserve the legacy lazy-regex behavior by stopping at the first
+        # supported image suffix after the absolute-path marker.
+        lowered = token.lower()
+        end = 0
+        for suffix in _IMAGE_SUFFIXES:
+            suffix_at = lowered.find(suffix, path_start)
+            if suffix_at >= 0:
+                suffix_end = suffix_at + len(suffix)
+                if not end or suffix_end < end:
+                    end = suffix_end
+        if not end:
+            continue
+        prefix = token[:end]
+        path = prefix[path_start:end]
         try:
             if os.path.isfile(path) and os.path.getmtime(path) >= since - 1:
                 return path
