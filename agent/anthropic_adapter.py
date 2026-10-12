@@ -982,6 +982,26 @@ def build_anthropic_bedrock_client(region: str):
 
 
 def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+    """Read the config-directory-specific Claude Code Keychain entry first.
+
+    Claude Code hashes an explicitly set CLAUDE_CONFIG_DIR into its service
+    name, even when the directory equals the default ~/.claude directory.
+    Keep the legacy service as a fallback; never copy credentials to disk.
+    """
+    import hashlib
+
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir and platform.system() == "Darwin":
+        suffix = hashlib.sha256(config_dir.encode("utf-8")).hexdigest()[:8]
+        configured = _read_claude_code_keychain_service(
+            f"Claude Code-credentials-{suffix}"
+        )
+        if configured:
+            return configured
+    return _read_claude_code_keychain_service("Claude Code-credentials")
+
+
+def _read_claude_code_keychain_service(service: str) -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from the macOS Keychain.
 
     Claude Code >=2.1.114 stores credentials in the macOS Keychain under the
@@ -1000,7 +1020,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         # Read the "Claude Code-credentials" generic password entry
         result = subprocess.run(
             ["security", "find-generic-password",
-             "-s", "Claude Code-credentials",
+             "-s", service,
              "-w"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
